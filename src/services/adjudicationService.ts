@@ -118,18 +118,67 @@ export class AdjudicationService {
   }
 
   /**
+   * Check policy limits for a category
+   */
+  private checkPolicyLimit(
+    policy: PolicyData,
+    category: 'medicine' | 'lab' | 'other',
+    itemAmount: number,
+    categoryTotalUsed: number = 0
+  ): { withinLimit: boolean; limitAmount?: number; remaining?: number; reason?: string } {
+    const coverageLimits = policy.policy_coverage.coverage_limits || [];
+    
+    let limitConfig: any = null;
+    if (category === 'medicine') {
+      limitConfig = coverageLimits.find(l => 
+        l.benefit_name.toLowerCase().includes('pharmacy') || 
+        l.benefit_name.toLowerCase().includes('medicine')
+      );
+    } else if (category === 'lab') {
+      limitConfig = coverageLimits.find(l => 
+        l.benefit_name.toLowerCase().includes('diagnostic') || 
+        l.benefit_name.toLowerCase().includes('pathology') || 
+        l.benefit_name.toLowerCase().includes('radiology')
+      );
+    }
+    
+    if (!limitConfig || limitConfig.limit_amount === 0) {
+      return { withinLimit: true }; // Unlimited or no limit
+    }
+    
+    const limitAmount = limitConfig.limit_amount;
+    const remaining = limitAmount - categoryTotalUsed;
+    const withinLimit = (categoryTotalUsed + itemAmount) <= limitAmount;
+    
+    if (!withinLimit) {
+      const reimbursableAmount = Math.max(0, remaining);
+      return {
+        withinLimit: false,
+        limitAmount,
+        remaining: reimbursableAmount,
+        reason: `Policy limit exceeded: ${limitConfig.benefit_name} limit ₹${limitAmount.toLocaleString('en-IN')}/${limitConfig.limit_type}. Used: ₹${categoryTotalUsed.toLocaleString('en-IN')}. Remaining: ₹${reimbursableAmount.toLocaleString('en-IN')}. Item cost ₹${itemAmount.toLocaleString('en-IN')} exceeds remaining limit by ₹${(itemAmount - reimbursableAmount).toLocaleString('en-IN')}.`
+      };
+    }
+    
+    return { withinLimit: true, limitAmount, remaining };
+  }
+
+  /**
    * Check if item is covered by policy with detailed reason
    */
   private checkItemCoverage(
     policy: PolicyData,
     itemName: string,
     category: 'medicine' | 'lab' | 'other',
-    isPrescriptionMatch: boolean
-  ): { covered: boolean; reason?: string } {
+    isPrescriptionMatch: boolean,
+    itemAmount?: number,
+    categoryTotalUsed?: number
+  ): { covered: boolean; reason?: string; reimbursableAmount?: number } {
     // If not in prescription, it's not covered (for medicines and labs)
     if ((category === 'medicine' || category === 'lab') && !isPrescriptionMatch) {
       return {
         covered: false,
+        reimbursableAmount: 0,
         reason: category === 'medicine' 
           ? `Medicine "${itemName}" is not prescribed in the prescription`
           : `Lab test "${itemName}" is not prescribed in the prescription`
@@ -140,6 +189,7 @@ export class AdjudicationService {
     if (this.isExcluded(policy, itemName)) {
       return {
         covered: false,
+        reimbursableAmount: 0,
         reason: this.getItemNotCoveredReason(policy, itemName, category)
       };
     }
@@ -154,6 +204,7 @@ export class AdjudicationService {
       if (!hasPharmacyCoverage) {
         return {
           covered: false,
+          reimbursableAmount: 0,
           reason: `Medicines are not covered under this policy. Available benefits: ${coveredBenefits.join(', ')}`
         };
       }
@@ -166,12 +217,40 @@ export class AdjudicationService {
       if (!hasDiagnosticsCoverage) {
         return {
           covered: false,
+          reimbursableAmount: 0,
           reason: `Lab tests/Diagnostics are not covered under this policy. Available benefits: ${coveredBenefits.join(', ')}`
         };
       }
     }
 
-    return { covered: true };
+    // Check policy limits if amount provided
+    if (itemAmount !== undefined && categoryTotalUsed !== undefined) {
+      const limitCheck = this.checkPolicyLimit(policy, category, itemAmount, categoryTotalUsed);
+      if (!limitCheck.withinLimit) {
+        // Partial approval if there's remaining limit
+        const partialAmount = limitCheck.remaining || 0;
+        if (partialAmount > 0) {
+          // Partially covered - can reimburse up to remaining limit
+          return {
+            covered: true, // Mark as covered for partial approval
+            reimbursableAmount: partialAmount,
+            reason: limitCheck.reason
+          };
+        } else {
+          // Completely rejected - limit exhausted
+          return {
+            covered: false,
+            reimbursableAmount: 0,
+            reason: limitCheck.reason
+          };
+        }
+      }
+    }
+
+    return { 
+      covered: true, 
+      reimbursableAmount: itemAmount !== undefined ? itemAmount : undefined 
+    };
   }
 
   /**
@@ -266,24 +345,7 @@ export class AdjudicationService {
       }
     }
 
-    // Check reimbursement type and benefit coverage
-    const reimbursementType = invoiceData?.reimbursement_type || 
-                              invoiceData?.data?.reimbursement_type;
-    
-    if (reimbursementType) {
-      const benefitCovered = this.isBenefitCovered(policy, reimbursementType);
-      policyValidation.benefitCoverage = benefitCovered;
-      
-      if (!benefitCovered) {
-        rejectionReasons.push({
-          value: 'benefitNotCovered',
-          title: 'Benefit is not covered in policy',
-          reasoning: `Reimbursement type "${reimbursementType}" is not covered under the policy`,
-        });
-      }
-    }
-
-    // Get invoice line items
+    // Get invoice line items first
     const invoiceMedicines = invoiceData?.billing_info?.line_items?.medicines || 
                              invoiceData?.data?.billing_info?.line_items?.medicines || [];
     const invoiceLabTests = invoiceData?.billing_info?.line_items?.lab_tests || 
@@ -291,55 +353,145 @@ export class AdjudicationService {
     const invoiceOthers = invoiceData?.billing_info?.line_items?.others || 
                          invoiceData?.data?.billing_info?.line_items?.others || [];
 
+    // Check reimbursement type and benefit coverage
+    // Handle both string and object formats
+    let reimbursementType: string | undefined;
+    const rawReimbursementType = invoiceData?.reimbursement_type || 
+                                 invoiceData?.data?.reimbursement_type;
+    
+    if (rawReimbursementType) {
+      // Handle object format: { type: "..." }
+      if (typeof rawReimbursementType === 'object' && rawReimbursementType.type) {
+        reimbursementType = rawReimbursementType.type;
+      } 
+      // Handle string format
+      else if (typeof rawReimbursementType === 'string') {
+        reimbursementType = rawReimbursementType;
+      }
+    }
+    
+    if (reimbursementType && reimbursementType.trim() !== '') {
+      const benefitCovered = this.isBenefitCovered(policy, reimbursementType);
+      policyValidation.benefitCoverage = benefitCovered;
+      
+      if (!benefitCovered) {
+        rejectionReasons.push({
+          value: 'benefitNotCovered',
+          title: 'Benefit is not covered in policy',
+          reasoning: `Reimbursement type "${reimbursementType}" is not covered under the policy. Available benefits: ${policy.policy_coverage.covered_benefits.join(', ')}`,
+        });
+      }
+    } else {
+      // If reimbursement type is missing or empty, don't reject based on type alone
+      // Individual item checks will handle coverage validation
+      policyValidation.benefitCoverage = true; // Set to true to avoid false rejection
+    }
+
     console.log(`[Adjudication] Invoice items - Medicines: ${invoiceMedicines.length}, Lab Tests: ${invoiceLabTests.length}, Others: ${invoiceOthers.length}`);
     console.log(`[Adjudication] Policy covered benefits:`, policy.policy_coverage.covered_benefits);
     console.log(`[Adjudication] Policy exclusions:`, policy.policy_exclusions.excluded_conditions);
 
-    // Check each medicine against policy
-    const uncoveredMedicines: string[] = [];
+    // Track amounts for partial claim support
+    let totalClaimedAmount = 0;
+    let totalReimbursableAmount = 0;
+    let medicineTotalUsed = 0;
+    let labTestTotalUsed = 0;
+    const uncoveredItems: Array<{ category: string; name: string; reason: string; amount: number; reimbursableAmount: number }> = [];
+    const policyLimitInsights: string[] = [];
+
+    // Process medicines - item-level adjudication
     for (let i = 0; i < invoiceMedicines.length; i++) {
       const medicine = invoiceMedicines[i];
       const match = matchingResults.medicines[i] || { isPrescriptionMatch: false };
-      const coverage = this.checkItemCoverage(policy, medicine.name, 'medicine', match.isPrescriptionMatch);
+      const itemAmount = medicine.total_cost || medicine.total || 0;
+      totalClaimedAmount += itemAmount;
       
-      if (!coverage.covered) {
-        uncoveredMedicines.push(coverage.reason || `Medicine "${medicine.name}" is not covered`);
+      const coverage = this.checkItemCoverage(
+        policy, 
+        medicine.name, 
+        'medicine', 
+        match.isPrescriptionMatch,
+        itemAmount,
+        medicineTotalUsed
+      );
+      
+      const reimbursable = coverage.reimbursableAmount !== undefined ? coverage.reimbursableAmount : (coverage.covered ? itemAmount : 0);
+      
+      if (coverage.covered || reimbursable > 0) {
+        // Item is fully or partially covered
+        totalReimbursableAmount += reimbursable;
+        medicineTotalUsed += reimbursable;
+        
+        // Update match with adjudicated amount
+        if (matchingResults.medicines[i]) {
+          (matchingResults.medicines[i] as any).adjudicatedAmount = reimbursable;
+        }
+        
+        // If partially covered (limit exceeded), add insight
+        if (reimbursable > 0 && reimbursable < itemAmount) {
+          policyLimitInsights.push(coverage.reason || `Partial approval: ₹${reimbursable.toLocaleString('en-IN')} of ₹${itemAmount.toLocaleString('en-IN')} for "${medicine.name}"`);
+        }
+      } else {
+        // Item is completely rejected
+        uncoveredItems.push({
+          category: 'medicine',
+          name: medicine.name,
+          reason: coverage.reason || `Medicine "${medicine.name}" is not covered`,
+          amount: itemAmount,
+          reimbursableAmount: 0
+        });
       }
     }
 
-    if (uncoveredMedicines.length > 0) {
-      rejectionReasons.push({
-        value: 'benefitNotCovered',
-        title: 'Medicines not covered under policy',
-        reasoning: uncoveredMedicines.join('; ')
-      });
-    }
-
-    // Check each lab test against policy
-    const uncoveredLabTests: string[] = [];
+    // Process lab tests - item-level adjudication
     for (let i = 0; i < invoiceLabTests.length; i++) {
       const labTest = invoiceLabTests[i];
       const match = matchingResults.labTests[i] || { isPrescriptionMatch: false };
-      const coverage = this.checkItemCoverage(policy, labTest.name, 'lab', match.isPrescriptionMatch);
+      const itemAmount = labTest.total_cost || labTest.total || 0;
+      totalClaimedAmount += itemAmount;
       
-      if (!coverage.covered) {
-        uncoveredLabTests.push(coverage.reason || `Lab test "${labTest.name}" is not covered`);
+      const coverage = this.checkItemCoverage(
+        policy, 
+        labTest.name, 
+        'lab', 
+        match.isPrescriptionMatch,
+        itemAmount,
+        labTestTotalUsed
+      );
+      
+      const reimbursable = coverage.reimbursableAmount !== undefined ? coverage.reimbursableAmount : (coverage.covered ? itemAmount : 0);
+      
+      if (coverage.covered || reimbursable > 0) {
+        // Item is fully or partially covered
+        totalReimbursableAmount += reimbursable;
+        labTestTotalUsed += reimbursable;
+        
+        // Update match with adjudicated amount
+        if (matchingResults.labTests[i]) {
+          (matchingResults.labTests[i] as any).adjudicatedAmount = reimbursable;
+        }
+        
+        // If partially covered (limit exceeded), add insight
+        if (reimbursable > 0 && reimbursable < itemAmount) {
+          policyLimitInsights.push(coverage.reason || `Partial approval: ₹${reimbursable.toLocaleString('en-IN')} of ₹${itemAmount.toLocaleString('en-IN')} for "${labTest.name}"`);
+        }
+      } else {
+        // Item is completely rejected
+        uncoveredItems.push({
+          category: 'lab',
+          name: labTest.name,
+          reason: coverage.reason || `Lab test "${labTest.name}" is not covered`,
+          amount: itemAmount,
+          reimbursableAmount: 0
+        });
       }
     }
 
-    if (uncoveredLabTests.length > 0) {
-      rejectionReasons.push({
-        value: 'benefitNotCovered',
-        title: 'Lab tests not covered under policy',
-        reasoning: uncoveredLabTests.join('; ')
-      });
-    }
-
-    // Check each other item against policy
-    const uncoveredOthers: string[] = [];
+    // Process others - item-level adjudication
     for (let i = 0; i < invoiceOthers.length; i++) {
       const other = invoiceOthers[i];
       const match = matchingResults.others[i] || { isPrescriptionMatch: false };
+      const itemAmount = other.total_cost || other.total || 0;
       
       // Financial items are auto-approved
       const nameLower = other.name.toLowerCase();
@@ -349,30 +501,93 @@ export class AdjudicationService {
                          nameLower.includes('cgst') ||
                          nameLower.includes('sgst');
       
-      if (!isFinancial) {
-        const coverage = this.checkItemCoverage(policy, other.name, 'other', match.isPrescriptionMatch);
+      if (isFinancial) {
+        // Financial items are always approved
+        totalClaimedAmount += itemAmount;
+        totalReimbursableAmount += itemAmount;
+      } else {
+        totalClaimedAmount += itemAmount;
+        const coverage = this.checkItemCoverage(policy, other.name, 'other', match.isPrescriptionMatch || false);
         
-        if (!coverage.covered) {
-          uncoveredOthers.push(coverage.reason || `Service "${other.name}" is not covered`);
+        if (coverage.covered) {
+          totalReimbursableAmount += itemAmount;
+        } else {
+          uncoveredItems.push({
+            category: 'other',
+            name: other.name,
+            reason: coverage.reason || `Service "${other.name}" is not covered`,
+            amount: itemAmount,
+            reimbursableAmount: 0
+          });
         }
       }
+    }
+
+    // Group uncovered items by category for rejection reasons
+    const uncoveredMedicines = uncoveredItems.filter(item => item.category === 'medicine' && item.reimbursableAmount === 0);
+    const uncoveredLabTests = uncoveredItems.filter(item => item.category === 'lab' && item.reimbursableAmount === 0);
+    const uncoveredOthers = uncoveredItems.filter(item => item.category === 'other');
+
+    // Only add rejection reasons for items that are completely rejected (not partial)
+    if (uncoveredMedicines.length > 0) {
+      rejectionReasons.push({
+        value: 'benefitNotCovered',
+        title: 'Medicines not covered under policy',
+        reasoning: uncoveredMedicines.map(item => item.reason).join('; ')
+      });
+    }
+
+    if (uncoveredLabTests.length > 0) {
+      rejectionReasons.push({
+        value: 'benefitNotCovered',
+        title: 'Lab tests not covered under policy',
+        reasoning: uncoveredLabTests.map(item => item.reason).join('; ')
+      });
     }
 
     if (uncoveredOthers.length > 0) {
       rejectionReasons.push({
         value: 'benefitNotCovered',
         title: 'Services not covered under policy',
-        reasoning: uncoveredOthers.join('; ')
+        reasoning: uncoveredOthers.map(item => item.reason).join('; ')
       });
     }
 
-    // Check for fraud in digitized documents (if available)
-    // This would come from digitization service fraud_analysis
+    // Check coverage limits
+    const sumInsured = policy.policy_basic_info.sum_insured || 0;
+    const coverageLimitsValid = sumInsured === 0 || totalReimbursableAmount <= sumInsured;
+    policyValidation.coverageLimits = coverageLimitsValid;
 
-    // Final decision
-    const approved = rejectionReasons.length === 0;
+    if (!coverageLimitsValid) {
+      const remaining = Math.max(0, sumInsured);
+      policyLimitInsights.push(`Total sum insured limit ₹${sumInsured.toLocaleString('en-IN')} exceeded. Claimed: ₹${totalClaimedAmount.toLocaleString('en-IN')}, Reimbursable: ₹${totalReimbursableAmount.toLocaleString('en-IN')}, Remaining limit: ₹${remaining.toLocaleString('en-IN')}.`);
+    }
 
-    console.log(`[Adjudication] Final decision - Approved: ${approved}, Rejection reasons: ${rejectionReasons.length}`);
+    // Final decision - approve if there's any reimbursable amount (partial claim)
+    // Only fully reject if there are critical issues (policy not active, etc.) AND no reimbursable amount
+    const hasCriticalRejections = rejectionReasons.some(r => 
+      r.value === 'policyNotFound' || 
+      r.value === 'policyNotActive' || 
+      r.value === 'invoiceBeforePolicyDate'
+    );
+    
+    const approved = totalReimbursableAmount > 0 && !hasCriticalRejections;
+
+    // Build AI explanation
+    let aiExplanation = '';
+    if (totalReimbursableAmount > 0 && totalReimbursableAmount < totalClaimedAmount) {
+      aiExplanation = `Partial claim approved. Claimed: ₹${totalClaimedAmount.toLocaleString('en-IN')}, Reimbursable: ₹${totalReimbursableAmount.toLocaleString('en-IN')} (${((totalReimbursableAmount / totalClaimedAmount) * 100).toFixed(1)}%).`;
+      if (policyLimitInsights.length > 0) {
+        aiExplanation += ' ' + policyLimitInsights.join(' ');
+      }
+    } else if (totalReimbursableAmount === totalClaimedAmount && totalReimbursableAmount > 0) {
+      aiExplanation = `Full claim approved. All items are covered under the policy.`;
+    } else {
+      aiExplanation = `Claim rejected. No items are eligible for reimbursement.`;
+    }
+
+    console.log(`[Adjudication] Final decision - Approved: ${approved}`);
+    console.log(`[Adjudication] Total claimed: ₹${totalClaimedAmount}, Total reimbursable: ₹${totalReimbursableAmount}`);
     if (rejectionReasons.length > 0) {
       console.log(`[Adjudication] Rejection reasons:`, JSON.stringify(rejectionReasons, null, 2));
     }
@@ -380,8 +595,13 @@ export class AdjudicationService {
     return {
       approved,
       rejectionReasons: rejectionReasons.length > 0 ? rejectionReasons : undefined,
+      totalClaimedAmount,
+      totalReimbursableAmount,
+      aiExplanation,
       notes: approved 
-        ? 'Adjudication completed successfully - all checks passed' 
+        ? (totalReimbursableAmount === totalClaimedAmount 
+          ? 'Adjudication completed successfully - all items approved' 
+          : `Partial claim approved - ${totalReimbursableAmount.toLocaleString('en-IN')} of ${totalClaimedAmount.toLocaleString('en-IN')} reimbursable`)
         : `Adjudication failed with ${rejectionReasons.length} rejection reason(s)`,
       processedAt: new Date(),
       matchingResults,

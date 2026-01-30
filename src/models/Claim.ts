@@ -14,6 +14,9 @@ const AdjudicationResultSchema = new Schema<AdjudicationResult>({
     default: []
   },
   notes: { type: String },
+  totalClaimedAmount: { type: Number },
+  totalReimbursableAmount: { type: Number },
+  aiExplanation: { type: String },
   processedAt: { type: Date, default: Date.now },
   matchingResults: {
     medicines: { type: [Schema.Types.Mixed], default: [] },
@@ -33,7 +36,8 @@ const ClaimSchema = new Schema<IClaimDocument>(
     },
     prescriptionsUrls: {
       type: [{
-        url: { type: String, required: true }
+        url: { type: String, required: true },
+        documentId: { type: Schema.Types.Mixed, required: false }
       }],
       required: true,
       validate: {
@@ -43,7 +47,8 @@ const ClaimSchema = new Schema<IClaimDocument>(
     },
     invoiceUrls: {
       type: [{
-        url: { type: String, required: true }
+        url: { type: String, required: true },
+        documentId: { type: Schema.Types.Mixed, required: false }
       }],
       required: true,
       validate: {
@@ -53,7 +58,8 @@ const ClaimSchema = new Schema<IClaimDocument>(
     },
     supportDocumentsUrl: {
       type: [{
-        url: { type: String, required: true }
+        url: { type: String, required: true },
+        documentId: { type: Schema.Types.Mixed, required: false }
       }],
       default: []
     },

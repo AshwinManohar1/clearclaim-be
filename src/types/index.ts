@@ -38,9 +38,9 @@ export interface ClaimInput {
   patientDetails: {
     name: string;
   };
-  prescriptionsUrls: Array<{ url: string }>;
-  invoiceUrls: Array<{ url: string }>;
-  supportDocumentsUrl: Array<{ url: string }>; // lab reports
+  prescriptionsUrls: Array<{ url: string; documentId?: number | string }>;
+  invoiceUrls: Array<{ url: string; documentId?: number | string }>;
+  supportDocumentsUrl: Array<{ url: string; documentId?: number | string }>; // lab reports
   userRaisedAmount: string;
   requestDate: string;
   policyDocuments: Array<{ policyName: string }>;
@@ -56,6 +56,7 @@ export interface MedicineMatch {
   reason: string;
   potentialOCRError?: boolean;
   suggestedAlternatives?: string[];
+  adjudicatedAmount?: number;
 }
 
 export interface LabTestMatch {
@@ -69,6 +70,7 @@ export interface LabTestMatch {
   potentialOCRError?: boolean;
   suggestedAlternatives?: string[];
   requiresManualReview?: boolean;
+  adjudicatedAmount?: number;
 }
 
 export interface OthersMatch {
@@ -128,6 +130,9 @@ export interface AdjudicationResult {
     reasoning: string;
   }>;
   notes?: string;
+  totalClaimedAmount?: number;
+  totalReimbursableAmount?: number;
+  aiExplanation?: string;
   processedAt: Date;
   matchingResults?: {
     medicines?: MedicineMatch[];
@@ -145,9 +150,9 @@ export interface AdjudicationResult {
 export interface IClaim {
   _id?: string;
   patientDetails: { name: string };
-  prescriptionsUrls: Array<{ url: string }>;
-  invoiceUrls: Array<{ url: string }>;
-  supportDocumentsUrl: Array<{ url: string }>;
+  prescriptionsUrls: Array<{ url: string; documentId?: number | string }>;
+  invoiceUrls: Array<{ url: string; documentId?: number | string }>;
+  supportDocumentsUrl: Array<{ url: string; documentId?: number | string }>;
   userRaisedAmount: string;
   requestDate: string;
   policyDocuments: Array<{ policyName: string }>;

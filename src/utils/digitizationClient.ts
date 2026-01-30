@@ -12,7 +12,7 @@ class DigitizationClient {
         'Authorization': `Bearer ${env.digitizationApiKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 60000, // 60 seconds timeout
+      timeout: 300000, // 5 minutes timeout (300 seconds)
     });
   }
 
